@@ -148,6 +148,7 @@ class LlamaRMSNorm(nn.Module):
 
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
+        self.hidden_size = hidden_size
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
@@ -157,17 +158,16 @@ class LlamaRMSNorm(nn.Module):
         x = hidden_states
         doubled = torch.cat([x, -x], dim=-1)
 
-        hidden_size = hidden_states.shape[-1]
         normed = F.layer_norm(
             doubled,
-            normalized_shape=(2 * hidden_size,),
+            normalized_shape=(2 * self.hidden_size,),
             weight=None,
             bias=None,
             eps=float(self.variance_epsilon)
         )
 
         # Drop the mirror half
-        normed = normed[..., :hidden_size]
+        normed = normed[..., :self.hidden_size]
 
         # Apply learnable gain
         return (normed * self.weight.to(normed.dtype).to(normed.device))
@@ -288,8 +288,6 @@ class LlamaAttention(nn.Module):
 
     def get_new_kv_cache(self, hidden_states, current_pos, rotary_emb):
         """Get new key-value cache entries for single token generation."""
-        bsz, q_len, _ = hidden_states.shape
-
         # Project QKV
         hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
         query_states = self.q_proj(hidden_states).view(
@@ -312,8 +310,6 @@ class LlamaAttention(nn.Module):
 
     def get_new_kv_cache_prefill(self, hidden_states, current_pos, rotary_emb, batch_size):
         """Get new key-value cache entries for prefill mode."""
-        _, batch, _ = hidden_states.shape
-
         hidden_states = hidden_states.permute(0, 2, 1).unsqueeze(2).to(MODEL_DTYPE)
 
         query_states = self.q_proj(hidden_states)
@@ -321,13 +317,13 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(
-            1, self.num_heads, self.head_dim, batch
+            1, self.num_heads, self.head_dim, -1
         ).permute(0, 1, 3, 2)
         key_states = key_states.view(
-            1, self.num_key_value_heads, self.head_dim, batch
+            1, self.num_key_value_heads, self.head_dim, -1
         ).permute(0, 1, 3, 2)
         value_states = value_states.view(
-            1, self.num_key_value_heads, self.head_dim, batch
+            1, self.num_key_value_heads, self.head_dim, -1
         ).permute(0, 1, 3, 2)
 
         cos, sin = rotary_emb
@@ -345,7 +341,7 @@ class LlamaAttention(nn.Module):
 
         def rotate(x, cos, sin):
             x = x.contiguous()
-            half_dim = x.shape[-1] // 2
+            half_dim = self.head_dim // 2
 
             x1 = x[..., :half_dim]
             x2 = x[..., half_dim:]
@@ -377,13 +373,11 @@ class LlamaAttention(nn.Module):
         """Repeat key/value heads for multi-head attention."""
         x = x.unsqueeze(1)
         x = x.repeat(1, n_rep, 1, 1)
-        x = x.view(1, -1, x.size(-2), x.size(-1))
+        x = x.reshape(1, self.num_heads, -1, self.head_dim)
         return x
 
     def forward_regular(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None):
         """Forward pass for single token generation."""
-        bsz, q_len, _ = hidden_states.shape
-
         K_layer_cache, V_layer_cache = kv_cache_layer
         K_layer_cache = K_layer_cache[..., :self.config.context_length, :]
         V_layer_cache = V_layer_cache[..., :self.config.context_length, :]
@@ -402,15 +396,13 @@ class LlamaAttention(nn.Module):
         attn_output = torch.matmul(attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(1, -1, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
 
     def forward_prefill(self, hidden_states, query_states, kv_cache_layer=None, causal_mask=None):
         """Forward pass for prefill mode."""
-        bsz, q_len, _ = hidden_states.shape
-
         K_layer_cache, V_layer_cache = kv_cache_layer
         K_layer_cache = K_layer_cache[..., :self.config.context_length, :]
         V_layer_cache = V_layer_cache[..., :self.config.context_length, :]
@@ -429,7 +421,7 @@ class LlamaAttention(nn.Module):
         attn_output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, value_states)
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(1, -1, self.hidden_size)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -492,16 +484,15 @@ class LlamaModel(BaseModel):
     def get_rotary_embedding_prefill(self, positions):
         """Get rotary embeddings for multiple positions."""
         rotary_emb = self.layers[0].self_attn.rotary_emb
-        seq_len = positions.size(0)
-        cos = rotary_emb.cos_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
-        sin = rotary_emb.sin_cached[:, positions].view(1, seq_len, 1, rotary_emb.dim)
+        cos = rotary_emb.cos_cached[:, positions].view(1, -1, 1, rotary_emb.dim)
+        sin = rotary_emb.sin_cached[:, positions].view(1, -1, 1, rotary_emb.dim)
         return cos.to(MODEL_DTYPE), sin.to(MODEL_DTYPE)
 
     def process_layer(self, layer_idx, hidden_states, position_ids, causal_mask,
                       current_pos, rotary_emb, layer_offset, IN_PREFILL=False):
         """Process a single transformer layer."""
         layer = self.layers[layer_idx]
-        batch_size = position_ids.shape[0] if IN_PREFILL else 1
+        batch_size = 1  # batch_size no longer used in get_new_kv_cache_prefill body
 
         normalized_states = layer.input_layernorm(hidden_states)
 

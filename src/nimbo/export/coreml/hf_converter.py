@@ -137,6 +137,15 @@ def _extract_weights_from_hf_model(hf_model, output_dir: str):
 
     state_dict = hf_model.state_dict()
 
+    # Break shared memory between tied tensors (e.g. embed_tokens <-> lm_head)
+    seen_data_ptrs = {}
+    for key, tensor in state_dict.items():
+        ptr = tensor.data_ptr()
+        if ptr in seen_data_ptrs:
+            state_dict[key] = tensor.clone()
+        else:
+            seen_data_ptrs[ptr] = key
+
     # Save all weights to a single safetensors file
     output_path = os.path.join(output_dir, "model.safetensors")
     safetensors.torch.save_file(state_dict, output_path)
